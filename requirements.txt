@@ -1,0 +1,25 @@
+# Core web framework
+fastapi==0.116.2
+uvicorn==0.35.0
+
+# Browser automation and AI
+browser-use==0.7.8
+google-generativeai==0.8.3
+
+# AWS cloud storage
+boto3==1.40.33
+
+# Environment and configuration
+python-dotenv~=1.0.0
+
+# HTTP requests
+httpx==0.28.1
+
+# Data validation and serialization
+pydantic~=2.11.5
+
+# Structured logging
+structlog==25.4.0
+
+# Playwright for browser automation (auto-installed with browser-use)
+playwright==1.49.1
