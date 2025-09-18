@@ -65,12 +65,16 @@ class DocumentExtractor:
                 }
                 logger.info("Including NYSCR credentials for NY State authentication")
 
-            # Create browser agent with specialized task
+            # Create browser agent with specialized task and download interception
             agent_kwargs = {
                 "task": task,
                 "llm": self.llm,
                 "use_vision": True,
-                "max_failures": 3
+                "max_failures": 5,  # Increase for complex sites
+                "browser_config": {
+                    "download_dir": "/tmp/browser_downloads",
+                    "intercept_downloads": True
+                }
             }
 
             # Add sensitive data if we have credentials
@@ -89,15 +93,26 @@ class DocumentExtractor:
             # Extract PDF URLs from agent result
             raw_pdf_urls = self._extract_pdf_urls_from_result(result)
 
+            # Check for downloaded files in case of auto-downloads
+            downloaded_files = self._check_downloaded_files()
+
+            # Combine URLs and downloaded files
+            all_pdf_sources = raw_pdf_urls + downloaded_files
+
             # Validate and filter PDF URLs using PDFDetector
-            validated_pdf_urls = self.pdf_detector.validate_pdf_urls(raw_pdf_urls)
+            validated_pdf_urls = self.pdf_detector.validate_pdf_urls(all_pdf_sources)
             pdf_urls = self.pdf_detector.deduplicate_urls(validated_pdf_urls)
 
             if not pdf_urls:
-                logger.warning("No valid PDF URLs found by agent", raw_count=len(raw_pdf_urls))
+                logger.warning("No valid PDF URLs found by agent",
+                              raw_urls=len(raw_pdf_urls),
+                              downloaded_files=len(downloaded_files))
                 return []
 
-            logger.info("Found valid PDF URLs", raw_count=len(raw_pdf_urls), validated_count=len(pdf_urls))
+            logger.info("Found valid PDF sources",
+                       raw_urls=len(raw_pdf_urls),
+                       downloaded_files=len(downloaded_files),
+                       validated_count=len(pdf_urls))
 
             # Download and upload PDFs to S3
             uploaded_files = []
@@ -150,11 +165,44 @@ Your goal is to:
 
         platform_specific_instructions = {
             "california_ecal": """
-This is a California eCal procurement site. Look for:
-- "View Event Package" link or button
-- Document tabs or sections
-- PDF attachments in the solicitation details
-- Amendment documents if available
+This is a California eCal procurement site. CRITICAL: Follow this exact sequence:
+
+STEP 1: Find and Click "View Event Package" Button
+- Look for a button or link containing "View Event Package" or "Event Package"
+- This button is usually prominently displayed on the main event page
+- Click this button to navigate to the document listing page
+
+STEP 2: Wait for Document Page to Load
+- After clicking "View Event Package", wait for the new page to fully load
+- The page will show a list of PDF documents and attachments
+
+STEP 3: Extract PDF Download URLs Using Multiple Methods
+Try these approaches in order:
+
+Method A - Direct URL Extraction:
+- Look for direct PDF links ending in .pdf
+- Check href attributes of download links
+- Extract URLs from anchor tags
+
+Method B - Form-based Downloads:
+- Look for download buttons with data attributes or onclick handlers
+- Check for forms that submit to download endpoints
+- Inspect POST URLs that might contain file IDs
+
+Method C - Network Request Monitoring:
+- If direct URLs aren't visible, right-click on download buttons
+- Use "Inspect Element" to see the button's properties
+- Look for data-file-id, data-url, or onclick JavaScript
+
+STEP 4: Validate URLs
+- Ensure extracted URLs contain the domain and end with .pdf
+- Avoid page URLs or JavaScript void links
+
+IMPORTANT: Do NOT scroll looking for "Comments and Attachments" - the PDFs are accessed via the "View Event Package" button!
+
+Return format: One PDF URL per line, like:
+https://caleprocure.ca.gov/documents/12345/filename.pdf
+https://caleprocure.ca.gov/downloads/67890/document.pdf
 """,
             "ny_state": """
 This is a NY State procurement site that requires authentication. You have access to login credentials:
@@ -214,19 +262,63 @@ Focus only on legitimate PDF document URLs that contain procurement-related cont
 
             for line in lines:
                 line = line.strip()
-                if line and ('.pdf' in line.lower() or 'pdf' in line.lower()):
-                    # Try to extract URL from the line
-                    if line.startswith('http'):
-                        pdf_urls.append(line)
-                    elif 'http' in line:
-                        # Extract URL from text
-                        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-                        urls = re.findall(url_pattern, line)
-                        pdf_urls.extend(urls)
 
-            logger.info("Extracted PDF URLs from agent result", count=len(pdf_urls))
-            return pdf_urls
+                # Only process lines that start with http and contain .pdf
+                if line.startswith('http') and '.pdf' in line.lower():
+                    # Clean up the URL - remove any trailing characters
+                    url = line.split()[0]  # Take first word if multiple words
+
+                    # Additional validation - must end with .pdf or have .pdf? for parameters
+                    if url.lower().endswith('.pdf') or '.pdf?' in url.lower():
+                        pdf_urls.append(url)
+
+                elif 'http' in line and '.pdf' in line.lower():
+                    # Extract URL from text more carefully
+                    url_pattern = r'https?://[^\s<>"\']+\.pdf(?:\?[^\s<>"\']*)?'
+                    urls = re.findall(url_pattern, line, re.IGNORECASE)
+                    for url in urls:
+                        # Clean any trailing punctuation
+                        url = url.rstrip('.,;)')
+                        pdf_urls.append(url)
+
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_pdf_urls = []
+            for url in pdf_urls:
+                if url not in seen:
+                    seen.add(url)
+                    unique_pdf_urls.append(url)
+
+            logger.info("Extracted PDF URLs from agent result",
+                       total_lines=len(lines),
+                       raw_count=len(pdf_urls),
+                       unique_count=len(unique_pdf_urls))
+
+            return unique_pdf_urls
 
         except Exception as e:
             logger.error("Failed to extract PDF URLs from result", error=str(e))
+            return []
+
+    def _check_downloaded_files(self) -> List[str]:
+        """Check for PDF files that were automatically downloaded."""
+        try:
+            import os
+            download_dir = "/tmp/browser_downloads"
+
+            if not os.path.exists(download_dir):
+                return []
+
+            pdf_files = []
+            for filename in os.listdir(download_dir):
+                if filename.lower().endswith('.pdf'):
+                    file_path = os.path.join(download_dir, filename)
+                    # Convert local file to a pseudo-URL for processing
+                    pdf_files.append(f"file://{file_path}")
+
+            logger.info("Found downloaded PDF files", count=len(pdf_files))
+            return pdf_files
+
+        except Exception as e:
+            logger.error("Failed to check downloaded files", error=str(e))
             return []

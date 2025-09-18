@@ -50,8 +50,11 @@ class S3Uploader:
             filename = self._generate_filename_from_url(pdf_url)
             s3_key   = f"{s3_prefix.rstrip('/')}/{filename}"
 
-            # Download the PDF content
-            pdf_content = await self._download_pdf(pdf_url)
+            # Handle local files vs remote URLs
+            if pdf_url.startswith('file://'):
+                pdf_content = await self._read_local_file(pdf_url)
+            else:
+                pdf_content = await self._download_pdf(pdf_url)
 
             # Upload to S3
             await self._upload_to_s3(pdf_content, s3_bucket, s3_key)
@@ -77,6 +80,16 @@ class S3Uploader:
                 if 'pdf' not in content_type and not pdf_url.lower().endswith('.pdf'):
                     logger.warning("Content may not be PDF", content_type=content_type, url=pdf_url)
 
+                # Additional validation: check if content starts with PDF magic bytes
+                if len(response.content) >= 4:
+                    pdf_header = response.content[:4]
+                    if pdf_header != b'%PDF':
+                        logger.error("Downloaded content is not a valid PDF file",
+                                   content_type=content_type,
+                                   url=pdf_url,
+                                   first_bytes=pdf_header.hex() if pdf_header else "empty")
+                        raise ValueError(f"Downloaded content is not a PDF file: {content_type}")
+
                 logger.info("Downloaded PDF successfully", size_bytes=len(response.content))
                 return response.content
 
@@ -85,6 +98,33 @@ class S3Uploader:
             raise
         except Exception as e:
             logger.error("Unexpected error downloading PDF", error=str(e))
+            raise
+
+    async def _read_local_file(self, file_url: str) -> bytes:
+        """Read PDF content from local file."""
+        try:
+            # Convert file:// URL to local path
+            file_path = file_url.replace('file://', '')
+
+            with open(file_path, 'rb') as f:
+                content = f.read()
+
+            # Validate PDF content
+            if len(content) >= 4:
+                pdf_header = content[:4]
+                if pdf_header != b'%PDF':
+                    logger.error("Local file is not a valid PDF",
+                               file_path=file_path,
+                               first_bytes=pdf_header.hex())
+                    raise ValueError(f"File is not a PDF: {file_path}")
+
+            logger.info("Read local PDF file successfully",
+                       file_path=file_path,
+                       size_bytes=len(content))
+            return content
+
+        except Exception as e:
+            logger.error("Error reading local PDF file", file_url=file_url, error=str(e))
             raise
 
     async def _upload_to_s3(self, content: bytes, bucket: str, key: str) -> None:
