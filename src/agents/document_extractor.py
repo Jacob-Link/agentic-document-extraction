@@ -1,324 +1,261 @@
 import os
-import asyncio
 import re
-from typing import List, Dict, Any
-from urllib.parse import urlparse
+import time
+from typing import List, Any
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote
 import structlog
+import boto3
 
-from browser_use import Agent, ChatGoogle
-from ..utils.s3_uploader import S3Uploader
-from ..extractors.pdf_detector import PDFDetector
+from browser_use import Agent, Browser, ChatGoogle
 
 logger = structlog.get_logger(__name__)
 
+
 class DocumentExtractor:
-    """Main document extraction orchestrator using browser-use agent."""
+    """
+    CaleProcure-only extractor (Option 1):
+      - Persist downloads to disk (downloads_path=/tmp/browser_downloads).
+      - Poll until PDFs are fully written.
+      - Upload to S3.
+      - Delete local files afterwards.
+    """
+
+    HOST = "caleprocure.ca.gov"
+    DOWNLOAD_DIR = "/tmp/browser_downloads"
 
     def __init__(self):
-        """Initialize the document extractor with browser agent and supporting services."""
+        # LLM required by browser-use Agent
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not self.gemini_api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required")
 
-        # Initialize ChatGoogle LLM
         self.llm = ChatGoogle(model="gemini-2.5-flash")
 
-        # Initialize supporting services
-        self.s3_uploader = S3Uploader()
-        self.pdf_detector = PDFDetector()
+        # S3 via env creds (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION)
+        self.s3 = boto3.client("s3")
 
-        # Load NYSCR credentials for authenticated sites
-        self.nyscr_username = os.getenv("NYSCR_USERNAME")
-        self.nyscr_password = os.getenv("NYSCR_PASSWORD")
-        self.has_nyscr_credentials = bool(self.nyscr_username and self.nyscr_password)
+        # Ensure downloads dir exists
+        os.makedirs(self.DOWNLOAD_DIR, exist_ok=True)
 
-        logger.info("DocumentExtractor initialized successfully",
-                   has_nyscr_credentials=self.has_nyscr_credentials)
+        logger.info("CaleProcure DocumentExtractor initialized (Option 1: persistent downloads)",
+                    download_dir=self.DOWNLOAD_DIR)
+
+    # ---------------- Public API ----------------
 
     async def extract_documents(self, url: str, s3_bucket: str, s3_prefix: str) -> List[str]:
         """
-        Extract PDF documents from a procurement website and upload to S3.
-
-        Args:
-            url: URL of the procurement page
-            s3_bucket: S3 bucket name
-            s3_prefix: S3 prefix/folder path
-
-        Returns:
-            List of S3 URIs for uploaded files
+        Extract PDFs from CaleProcure and upload to S3, deleting local files afterward.
         """
-        logger.info("Starting document extraction", url=url, s3_bucket=s3_bucket, s3_prefix=s3_prefix)
+        self._assert_caleprocure(url)
+        logger.info("Starting CaleProcure extraction", url=url, bucket=s3_bucket, prefix=s3_prefix)
 
+        # Clean any leftovers from previous runs (best-effort)
+        self._purge_local_pdfs()
+
+        # Configure a real Browser with a persistent downloads path
+        browser = Browser(
+            headless=True,                   # set False to watch locally
+            is_local=True,
+            keep_alive=False,                # fine: we persist to disk
+            user_data_dir=None,              # set a path if you want login/cookies persistence
+            accept_downloads=True,
+            downloads_path=self.DOWNLOAD_DIR,
+            auto_download_pdfs=True,
+            allowed_domains=[f"*.{self.HOST}", f"https://{self.HOST}"],
+            minimum_wait_page_load_time=0.25,
+            wait_for_network_idle_page_load_time=0.75,
+            wait_between_actions=0.5,
+        )
+
+        # Deterministic flow: View Event Package -> click each attachment to download
+        task = self._create_caleprocure_task(url)
+        agent = Agent(
+            task=task,
+            llm=self.llm,
+            browser=browser,   # <-- critical: pass the configured Browser
+            use_vision=False,
+            max_failures=5,
+        )
+
+        # Run the agent
+        result = await agent.run()
+
+        # Optional: parse visible direct .pdf links (not relied upon by this flow)
+        direct_urls = self._extract_pdf_urls_from_result(result)
+        direct_urls = [u for u in direct_urls if self._is_caleprocure_pdf(u)]
+        logger.info("Agent returned direct URLs (optional)", count=len(direct_urls))
+
+        # Wait for the files to land & settle
+        downloaded_paths = self._wait_for_pdf_downloads(timeout_sec=45, settle_sec=1.5)
+        logger.info("Found browser-downloaded PDFs", count=len(downloaded_paths), files=downloaded_paths)
+
+        # Upload all to S3
+        uploaded_uris: List[str] = []
+        for path in downloaded_paths:
+            try:
+                s3_uri = self._upload_path_to_s3(path, s3_bucket, s3_prefix)
+                uploaded_uris.append(s3_uri)
+                logger.info("Uploaded PDF to S3", local=path, s3_uri=s3_uri)
+            except Exception as e:
+                logger.error("Failed to upload PDF to S3", local=path, error=str(e))
+
+        # Always delete local files afterward (best-effort)
+        self._purge_local_pdfs()
+
+        logger.info("CaleProcure extraction completed", total_files=len(uploaded_uris))
+        return uploaded_uris
+
+    # ---------------- Task / URL helpers ----------------
+
+    def _assert_caleprocure(self, url: str) -> None:
+        if self.HOST not in urlparse(url).netloc.lower():
+            raise ValueError("This extractor only supports caleprocure.ca.gov")
+
+    def _create_caleprocure_task(self, url: str) -> str:
+        return f"""
+Navigate to {url}.
+
+Follow this exact sequence:
+1) Find and click a button or link with text containing "View Event Package" (or "Event Package").
+2) Wait for the document page to fully load.
+3) Locate the list/table of attachments/documents (PDFs).
+4) Click each document's download link/button so the browser saves the PDF files locally.
+   The environment is configured to automatically accept downloads and save PDFs to disk.
+5) If a link opens a new tab or preview, proceed to ensure the file is downloaded.
+
+Finally:
+- If you can see any direct .pdf links on the page, list them (one per line).
+- The primary goal is that the files are downloaded locally.
+"""
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
         try:
-            # Determine platform type and create specialized task
-            platform_type = self._detect_platform_type(url)
-            task = self._create_extraction_task(url, platform_type)
+            parts = urlsplit(url)
+            path = quote(parts.path, safe="/-._~")
+            return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+        except Exception:
+            return url
 
-            logger.info("Creating browser agent", platform_type=platform_type)
+    def _is_caleprocure_pdf(self, url: str) -> bool:
+        p = urlparse(url)
+        return (self.HOST in p.netloc.lower()) and (".pdf" in p.path.lower())
 
-            # Prepare sensitive data for authentication if needed
-            sensitive_data = {}
-            if platform_type == "ny_state" and self.has_nyscr_credentials:
-                sensitive_data = {
-                    'nyscr_user': self.nyscr_username,
-                    'nyscr_pass': self.nyscr_password
-                }
-                logger.info("Including NYSCR credentials for NY State authentication")
-
-            # Create browser agent with specialized task and download interception
-            agent_kwargs = {
-                "task": task,
-                "llm": self.llm,
-                "use_vision": True,
-                "max_failures": 5,  # Increase for complex sites
-                "browser_config": {
-                    "download_dir": "/tmp/browser_downloads",
-                    "intercept_downloads": True
-                }
-            }
-
-            # Add sensitive data if we have credentials
-            if sensitive_data:
-                agent_kwargs["sensitive_data"] = sensitive_data
-                # Disable vision for security when handling credentials
-                agent_kwargs["use_vision"] = False
-                logger.info("Using secure mode (no vision) for credential handling")
-
-            agent = Agent(**agent_kwargs)
-
-            # Execute the agent task
-            logger.info("Executing browser agent task")
-            result = await agent.run()
-
-            # Extract PDF URLs from agent result
-            raw_pdf_urls = self._extract_pdf_urls_from_result(result)
-
-            # Check for downloaded files in case of auto-downloads
-            downloaded_files = self._check_downloaded_files()
-
-            # Combine URLs and downloaded files
-            all_pdf_sources = raw_pdf_urls + downloaded_files
-
-            # Validate and filter PDF URLs using PDFDetector
-            validated_pdf_urls = self.pdf_detector.validate_pdf_urls(all_pdf_sources)
-            pdf_urls = self.pdf_detector.deduplicate_urls(validated_pdf_urls)
-
-            if not pdf_urls:
-                logger.warning("No valid PDF URLs found by agent",
-                              raw_urls=len(raw_pdf_urls),
-                              downloaded_files=len(downloaded_files))
-                return []
-
-            logger.info("Found valid PDF sources",
-                       raw_urls=len(raw_pdf_urls),
-                       downloaded_files=len(downloaded_files),
-                       validated_count=len(pdf_urls))
-
-            # Download and upload PDFs to S3
-            uploaded_files = []
-            for pdf_url in pdf_urls:
-                try:
-                    s3_uri = await self.s3_uploader.download_and_upload_pdf(
-                        pdf_url=pdf_url,
-                        s3_bucket=s3_bucket,
-                        s3_prefix=s3_prefix
-                    )
-                    uploaded_files.append(s3_uri)
-                    logger.info("Successfully uploaded PDF", pdf_url=pdf_url, s3_uri=s3_uri)
-                except Exception as e:
-                    logger.error("Failed to upload PDF", pdf_url=pdf_url, error=str(e))
-
-            logger.info("Document extraction completed", total_files=len(uploaded_files))
-            return uploaded_files
-
-        except Exception as e:
-            logger.error("Document extraction failed", error=str(e))
-            raise
-
-    def _detect_platform_type(self, url: str) -> str:
-        """Detect the procurement platform type from URL."""
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc.lower()
-
-        if "caleprocure.ca.gov" in domain:
-            return "california_ecal"
-        elif "nyscr.ny.gov" in domain:
-            return "ny_state"
-        elif "sourcewell-mn.gov" in domain:
-            return "sourcewell"
-        else:
-            return "unknown"
-
-    def _create_extraction_task(self, url: str, platform_type: str) -> str:
-        """Create a specialized task prompt based on platform type."""
-        base_task = f"""
-Navigate to {url} and extract all PDF documents from this procurement page.
-
-Your goal is to:
-1. Navigate to the URL and wait for the page to fully load
-2. Look for any "View Event Package", "Documents", "Attachments", or similar links
-3. Click on document/attachment sections to reveal PDF files
-4. Find all PDF links on the page (look for .pdf extensions or PDF icons)
-5. Return a list of all PDF download URLs you find
-
-"""
-
-        platform_specific_instructions = {
-            "california_ecal": """
-This is a California eCal procurement site. CRITICAL: Follow this exact sequence:
-
-STEP 1: Find and Click "View Event Package" Button
-- Look for a button or link containing "View Event Package" or "Event Package"
-- This button is usually prominently displayed on the main event page
-- Click this button to navigate to the document listing page
-
-STEP 2: Wait for Document Page to Load
-- After clicking "View Event Package", wait for the new page to fully load
-- The page will show a list of PDF documents and attachments
-
-STEP 3: Extract PDF Download URLs Using Multiple Methods
-Try these approaches in order:
-
-Method A - Direct URL Extraction:
-- Look for direct PDF links ending in .pdf
-- Check href attributes of download links
-- Extract URLs from anchor tags
-
-Method B - Form-based Downloads:
-- Look for download buttons with data attributes or onclick handlers
-- Check for forms that submit to download endpoints
-- Inspect POST URLs that might contain file IDs
-
-Method C - Network Request Monitoring:
-- If direct URLs aren't visible, right-click on download buttons
-- Use "Inspect Element" to see the button's properties
-- Look for data-file-id, data-url, or onclick JavaScript
-
-STEP 4: Validate URLs
-- Ensure extracted URLs contain the domain and end with .pdf
-- Avoid page URLs or JavaScript void links
-
-IMPORTANT: Do NOT scroll looking for "Comments and Attachments" - the PDFs are accessed via the "View Event Package" button!
-
-Return format: One PDF URL per line, like:
-https://caleprocure.ca.gov/documents/12345/filename.pdf
-https://caleprocure.ca.gov/downloads/67890/document.pdf
-""",
-            "ny_state": """
-This is a NY State procurement site that requires authentication. You have access to login credentials:
-- Username: nyscr_user
-- Password: nyscr_pass
-
-Authentication steps:
-1. Look for login forms, "Sign In", "Login", or "Member Login" buttons/links
-2. Click the login button/link to access the login form
-3. Enter nyscr_user in the username/email field
-4. Enter nyscr_pass in the password field
-5. Submit the login form
-6. Wait for successful authentication and page redirect
-7. Then navigate to document sections and look for solicitation documents and amendments
-
-If login fails or credentials are rejected, report the authentication error.
-""",
-            "sourcewell": """
-This is a SourceWell procurement site. Look for:
-- Document tabs or sections in the tender details
-- PDF attachments in the solicitation
-- Any downloadable files related to the procurement
-"""
-        }
-
-        specific_instructions = platform_specific_instructions.get(platform_type, "")
-
-        # Add credential availability note for NY State
-        if platform_type == "ny_state" and not self.has_nyscr_credentials:
-            specific_instructions += """
-
-NOTE: No NYSCR credentials are available. You can:
-- Try to navigate any publicly accessible areas
-- Look for guest/public access options
-- Report if authentication is required for document access
-"""
-
-        return base_task + specific_instructions + """
-
-Return your findings as a simple list of PDF URLs, one per line.
-Focus only on legitimate PDF document URLs that contain procurement-related content.
-"""
+    # ---------------- Result parsing ----------------
 
     def _extract_pdf_urls_from_result(self, result: Any) -> List[str]:
-        """Extract PDF URLs from the agent's result."""
+        """Optional: extract direct .pdf links from the agent's output."""
         try:
-            if hasattr(result, 'content'):
-                content = result.content
-            elif isinstance(result, str):
-                content = result
-            else:
-                content = str(result)
+            content = getattr(result, "content", result)
+            content = content if isinstance(content, str) else str(content)
+            content = content.replace("\\n", "\n")
 
-            # Extract URLs that look like PDF links
-            pdf_urls = []
-            lines = content.split('\n')
+            pat = r'https?://[^\s<>"\']+\.pdf(?:\?[^\s<>"\']*)?'
+            found = re.findall(pat, content, flags=re.IGNORECASE)
 
-            for line in lines:
-                line = line.strip()
+            cleaned, seen = [], set()
+            for u in found:
+                u = u.strip().rstrip('.,;)"\'')
+                if u not in seen:
+                    seen.add(u)
+                    cleaned.append(u)
 
-                # Only process lines that start with http and contain .pdf
-                if line.startswith('http') and '.pdf' in line.lower():
-                    # Clean up the URL - remove any trailing characters
-                    url = line.split()[0]  # Take first word if multiple words
-
-                    # Additional validation - must end with .pdf or have .pdf? for parameters
-                    if url.lower().endswith('.pdf') or '.pdf?' in url.lower():
-                        pdf_urls.append(url)
-
-                elif 'http' in line and '.pdf' in line.lower():
-                    # Extract URL from text more carefully
-                    url_pattern = r'https?://[^\s<>"\']+\.pdf(?:\?[^\s<>"\']*)?'
-                    urls = re.findall(url_pattern, line, re.IGNORECASE)
-                    for url in urls:
-                        # Clean any trailing punctuation
-                        url = url.rstrip('.,;)')
-                        pdf_urls.append(url)
-
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_pdf_urls = []
-            for url in pdf_urls:
-                if url not in seen:
-                    seen.add(url)
-                    unique_pdf_urls.append(url)
-
-            logger.info("Extracted PDF URLs from agent result",
-                       total_lines=len(lines),
-                       raw_count=len(pdf_urls),
-                       unique_count=len(unique_pdf_urls))
-
-            return unique_pdf_urls
-
+            logger.info("Extracted PDF URLs from agent output",
+                        total_chars=len(content), raw_count=len(found), unique_count=len(cleaned))
+            return cleaned
         except Exception as e:
             logger.error("Failed to extract PDF URLs from result", error=str(e))
             return []
 
-    def _check_downloaded_files(self) -> List[str]:
-        """Check for PDF files that were automatically downloaded."""
-        try:
-            import os
-            download_dir = "/tmp/browser_downloads"
+    # ---------------- Download wait / cleanup / S3 ----------------
 
-            if not os.path.exists(download_dir):
+    def _wait_for_pdf_downloads(self, timeout_sec: int = 45, settle_sec: float = 1.5) -> List[str]:
+        """
+        Poll the downloads folder until at least one stable .pdf appears.
+        Stable == file exists, not .crdownload/.partial, and size stops changing for settle_sec.
+        Returns a list of absolute file paths.
+        """
+        start = time.time()
+        last_sizes = {}
+
+        def list_pdf_candidates() -> List[str]:
+            if not os.path.exists(self.DOWNLOAD_DIR):
                 return []
+            out = []
+            for f in os.listdir(self.DOWNLOAD_DIR):
+                fl = f.lower()
+                if fl.endswith(".pdf") and not fl.endswith(".crdownload") and not fl.endswith(".partial"):
+                    out.append(os.path.join(self.DOWNLOAD_DIR, f))
+            return out
 
-            pdf_files = []
-            for filename in os.listdir(download_dir):
-                if filename.lower().endswith('.pdf'):
-                    file_path = os.path.join(download_dir, filename)
-                    # Convert local file to a pseudo-URL for processing
-                    pdf_files.append(f"file://{file_path}")
+        stable_paths: List[str] = []
 
-            logger.info("Found downloaded PDF files", count=len(pdf_files))
-            return pdf_files
+        while time.time() - start < timeout_sec:
+            cand = list_pdf_candidates()
+            if not cand:
+                time.sleep(0.5)
+                continue
 
-        except Exception as e:
-            logger.error("Failed to check downloaded files", error=str(e))
-            return []
+            # track sizes to detect settling
+            stable_now = []
+            for path in cand:
+                try:
+                    sz = os.path.getsize(path)
+                except FileNotFoundError:
+                    continue
+                prev = last_sizes.get(path)
+                last_sizes[path] = sz
+                if prev is not None and prev == sz:
+                    stable_now.append(path)
+
+            if stable_now:
+                time.sleep(settle_sec)
+                confirm = []
+                for path in stable_now:
+                    try:
+                        if os.path.getsize(path) == last_sizes.get(path):
+                            confirm.append(path)
+                    except FileNotFoundError:
+                        pass
+                if confirm:
+                    stable_paths = sorted(set(confirm))
+                    break
+
+            time.sleep(0.5)
+
+        return stable_paths
+
+    def _purge_local_pdfs(self) -> None:
+        """Delete any PDFs in the downloads dir (best-effort cleanup)."""
+        if not os.path.exists(self.DOWNLOAD_DIR):
+            return
+        for f in os.listdir(self.DOWNLOAD_DIR):
+            if f.lower().endswith(".pdf") or f.endswith(".crdownload") or f.endswith(".partial"):
+                path = os.path.join(self.DOWNLOAD_DIR, f)
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.warning("Failed to remove local file", path=path, error=str(e))
+
+    def _upload_path_to_s3(self, path: str, bucket: str, prefix: str) -> str:
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        key = self._s3_key_for_local(path, prefix)
+        with open(path, "rb") as f:
+            self.s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=f.read(),
+                ContentType="application/pdf",
+            )
+        return f"s3://{bucket}/{key}"
+
+    @staticmethod
+    def _s3_key_for_local(local_path: str, prefix: str) -> str:
+        filename = os.path.basename(local_path) or "download.pdf"
+        prefix = prefix.strip("/")
+        return f"{prefix}/{filename}" if prefix else filename
+
+# TODO: 1. split up into tasks - first successfully locally download single PDF. if downloaded, stop.
+#       2. download pdf and upload it to S3.
+#       3. run on full page and extract all PDFs.
