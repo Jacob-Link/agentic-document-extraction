@@ -40,13 +40,13 @@ class DocumentExtractor:
         try:
             llm = ChatGoogle(model='gemini-2.5-flash')
             agent = Agent(
-                task="search for a fun fact regarding ai",
+                task="search google for: 'what is the time?' and return the time which appears",
                 llm=llm,
             )
             result = await agent.run()
-            logger.info("Browser-use test completed", fun_fact=result)
+            logger.info(">>> browser-use test completed", time_found=result)
         except Exception as e:
-            logger.warning("Browser-use test failed", error=str(e))
+            logger.warning(">>> browser-use test failed", error=str(e))
 
         # Generate dummy file names based on timestamp
         dummy_files = [

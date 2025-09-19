@@ -2,8 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# Install system dependencies for browser automation
+RUN apt-get update && apt-get install -y \
+    curl \
+    libglib2.0-0 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libxss1 \
+    libasound2 \
+    libatspi2.0-0 \
+    libgtk-3-0 \
+    libgdk-pixbuf-2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
 COPY requirements.txt .
