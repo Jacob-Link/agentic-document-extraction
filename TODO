@@ -1,11 +1,12 @@
 1. add versions to the env file packages
 2. look at s3_uploader.py to generate smarter filename, maybe call llm here
 3. ensure high quality logging (time taken, what the agent is doing at any time...)
-4. endure the sequence works:
+4. ensure the sequence works: (this was used for the debug True case)
 """
 docker-compose up -d
 curl -X POST http://localhost:8000/extract \
 -H "Content-Type: application/json" \
 -d '{"url": "https://caleprocure.ca.gov/event/0850/0000036230",
-"s3_bucket": "test-bucket", "s3_prefix": "test/"}'
+"s3_bucket": "my-solicitations", "s3_prefix": "test/"}'
 """
+5. understand how to get the PDFs from the test urls, make it work

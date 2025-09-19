@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import List
 import structlog
 from browser_use import Agent, ChatGoogle
+from ..s3.s3_dummy import S3DummyClient
 
 logger = structlog.get_logger(__name__)
 
@@ -40,13 +41,20 @@ class DocumentExtractor:
         try:
             llm = ChatGoogle(model='gemini-2.5-flash')
             agent = Agent(
-                task="search google for: 'what is the time?' and return the time which appears",
+                task="go to https://techcrunch.com, what is the main article presented - mainly about?",
                 llm=llm,
             )
             result = await agent.run()
-            logger.info(">>> browser-use test completed", time_found=result)
+            logger.info(">>> browser-use test completed", result=result.final_result())
         except Exception as e:
             logger.warning(">>> browser-use test failed", error=str(e))
+
+        try:
+            s3_client = S3DummyClient()
+            files = await s3_client.list_bucket_contents(s3_bucket, s3_prefix)
+            logger.info(">>> S3 test completed", bucket=s3_bucket, prefix=s3_prefix, file_count=len(files))
+        except Exception as e:
+            logger.warning(">>> S3 test failed", error=str(e))
 
         # Generate dummy file names based on timestamp
         dummy_files = [
