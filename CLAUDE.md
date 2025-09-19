@@ -2,9 +2,31 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Task Summary
+
+Build a containerized FastAPI service using Browser Use + Gemini 2.5+ that accepts URLs and autonomously downloads solicitation PDFs to S3 storage. The API takes procurement website URLs, navigates them intelligently (handling auth, JavaScript, dynamic content), discovers PDF attachments, and uploads them to configurable S3 buckets with proper naming.
+
+## MVP Development Approach
+
+This project follows a phased approach:
+1. **MVP Phase (Current)**: All components working except PDF downloads - using DEBUG=True mode
+2. **Production Phase**: Full PDF download and S3 upload functionality
+
+When `DEBUG=True`, the system uses dummy implementations:
+- `src/s3/s3_dummy.py`: Lists bucket content instead of downloading/uploading
+- `src/agent/document_extractor.py`: Returns timestamp-based dummy data instead of browser automation
+
+## Coding Conventions
+
+**Minimal and clean code only. No overhead.**
+- No unnecessary abstractions or complex patterns
+- Direct, straightforward implementations
+- Essential functionality only
+- Clean, readable code without bloat
+
 ## Project Overview
 
-This is an agentic document extraction API service that autonomously downloads solicitation PDFs from government procurement websites and uploads them to S3 storage. The service uses Browser Use with Gemini 2.5+ integration to handle complex web navigation, authentication, and document discovery.
+Agentic document extraction API service that autonomously downloads solicitation PDFs from government procurement websites and uploads them to S3 storage. Uses Browser Use with Gemini 2.5+ integration for complex web navigation, authentication, and document discovery.
 
 ## Technology Stack
 
@@ -22,12 +44,11 @@ src/
 ├── api/
 │   ├── main.py          # FastAPI application with /extract endpoint
 │   └── models.py        # Pydantic request/response models
-├── agents/
-│   └── document_extractor.py  # Main browser agent orchestrator
-├── extractors/
-│   └── pdf_detector.py  # PDF URL detection and validation
-└── utils/
-    └── s3_uploader.py   # S3 download and upload functionality
+├── agent/
+│   └── document_extractor.py  # Main browser agent orchestrator (with DEBUG mode)
+└── s3/
+    ├── s3_uploader.py   # S3 download and upload functionality
+    └── s3_dummy.py      # Dummy S3 operations for DEBUG mode
 
 tests/
 ├── test_gemini_key.py   # Test Gemini API connectivity
@@ -97,6 +118,7 @@ NYSCR_USERNAME=your_ny_state_username
 NYSCR_PASSWORD=your_ny_state_password
 PORT=8000
 BROWSER_HEADLESS=true
+DEBUG=true                # MVP mode: uses dummy implementations instead of real downloads
 ```
 
 ## Development Commands
@@ -145,31 +167,25 @@ curl -X POST http://localhost:8000/extract \
 
 ## Architecture Overview
 
-The system uses a multi-layered architecture:
+The system uses a simple layered architecture:
 
 1. **API Layer** (`src/api/`): FastAPI endpoints with request/response models
-2. **Agent Layer** (`src/agents/`): Browser automation using browser-use + Gemini 2.5
-3. **Extractor Layer** (`src/extractors/`): PDF detection and validation logic
-4. **Utility Layer** (`src/utils/`): S3 upload and file management
+2. **Agent Layer** (`src/agent/`): Browser automation using browser-use + Gemini 2.5 (with DEBUG mode support)
+3. **Storage Layer** (`src/s3/`): S3 upload functionality with dummy implementation for MVP
 
 ## Key Implementation Details
 
-### Browser Agent (`src/agents/document_extractor.py`)
-- Uses browser-use with ChatGoogle LLM for autonomous navigation
+### Browser Agent (`src/agent/document_extractor.py`)
+- **DEBUG=True**: Returns timestamp-based dummy data for MVP testing
+- **DEBUG=False**: Uses browser-use with ChatGoogle LLM for autonomous navigation
 - Platform-specific task prompts for different procurement sites
 - Handles complex JavaScript interactions and dynamic content
-- Extracts PDF URLs from agent execution results
 
-### S3 Integration (`src/utils/s3_uploader.py`)
-- Async download of PDFs using httpx
+### S3 Integration (`src/s3/`)
+- **s3_uploader.py**: Async download of PDFs using httpx with direct S3 upload
+- **s3_dummy.py**: Lists bucket content for MVP mode when DEBUG=True
 - Intelligent filename generation from URLs
-- Direct S3 upload with proper content types
 - Structured error handling and logging
-
-### PDF Detection (`src/extractors/pdf_detector.py`)
-- Pattern matching for PDF URLs and indicators
-- URL validation and deduplication
-- Support for relative and absolute PDF links
 
 ## Platform-Specific Behavior
 

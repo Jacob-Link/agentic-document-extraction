@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import structlog
 
 from .models import ExtractRequest, ExtractResponse, ErrorResponse
-from ..agents.document_extractor import DocumentExtractor
+from ..agent.document_extractor import DocumentExtractor
 
 load_dotenv()
 

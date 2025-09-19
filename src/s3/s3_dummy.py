@@ -1,0 +1,1 @@
+""" this is used when env var DEBUG == True, just lists the content of a bucket """
