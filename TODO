@@ -1,0 +1,3 @@
+1. add versions to the env file packages
+2. look at s3_uploader.py to generate smarter filename, maybe call llm here
+3. ensure high quality logging (time taken, what the agent is doing at any time...)

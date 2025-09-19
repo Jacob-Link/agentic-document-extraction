@@ -1,56 +1,14 @@
-version: '3.8'
-
 services:
-  agentic-extraction:
+  extractor:
     build: .
-    container_name: agentic-document-extraction
-    ports:
-      - "8000:8000"
-    environment:
-      # Gemini API Configuration
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-
-      # AWS Configuration
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-my-solicitations}
-
-      # NY State Credentials (optional)
-      - NYSCR_USERNAME=${NYSCR_USERNAME:-}
-      - NYSCR_PASSWORD=${NYSCR_PASSWORD:-}
-
-      # Application Configuration
-      - PORT=8000
-      - BROWSER_HEADLESS=true
-      - PYTHONPATH=/app
-
+    image: agentic-extractor:latest
+    platform: linux/arm64/v8   # Apple Silicon, avoid Rosetta
     env_file:
       - .env
-
+    environment:
+      DISK_DOWNLOAD_DIR: /data
+      HEADLESS: "true"
+      CLEAN_DOWNLOADS_AFTER: "false"
     volumes:
-      # Optional: Mount logs directory
-      - ./logs:/app/logs
-
-    restart: unless-stopped
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-    # Security settings
-    security_opt:
-      - no-new-privileges:true
-
-    # Limit resources
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
+      - ./data:/data
+    user: "${UID:-1000}:${GID:-1000}"

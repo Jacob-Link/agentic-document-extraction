@@ -1,41 +1,26 @@
-# Use Python 3.12 slim image
-FROM python:3.12-slim
+# Uses Python 3.12 + Chromium + proper system deps (multi-arch incl. arm64)
+FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DISK_DOWNLOAD_DIR=/data \
+    HEADLESS=true \
+    CLEAN_DOWNLOADS_AFTER=false
+
 WORKDIR /app
 
-# Install system dependencies and Playwright requirements in single layer
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Copy and install deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy requirements first for better Docker layer caching
-COPY requirements.txt .
+# Browsers are already present in this image; this is a harmless no-op:
+RUN python -m playwright install chromium
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# App code
+COPY . /app
 
-# Install Playwright browsers with system dependencies
-RUN playwright install chromium --with-deps
+# Downloads dir
+RUN mkdir -p /data && chmod -R 777 /data
 
-# Copy application code
-COPY src/ ./src/
-
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash app && \
-    chown -R app:app /app
-USER app
-
-# Expose port
-EXPOSE 8000
-
-# Set environment variables
-ENV PYTHONPATH=/app
-ENV BROWSER_HEADLESS=true
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Run the application
-CMD ["python", "-m", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "test_simple.py"]
