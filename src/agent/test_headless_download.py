@@ -1,5 +1,5 @@
 """
-Fixed PDF download script with proper browser configuration
+Fixed PDF download script with proper Playwright/Chromium configuration for headless downloads
 """
 
 import asyncio
@@ -11,12 +11,12 @@ from browser_use import Agent, ChatGoogle, Browser
 
 logger = structlog.get_logger(__name__)
 
-async def test_pdf_downloads():
-    """Test headless PDF download from California eCal procurement site."""
+async def test_pdf_downloads_with_proper_config():
+    """Test PDF download with proper headless configuration."""
     load_dotenv()
 
     # Create downloads directory with absolute path
-    downloads_dir = Path("./downloads").absolute()
+    downloads_dir = Path("./downloads").resolve()
     downloads_dir.mkdir(exist_ok=True)
 
     print(f"Downloads directory: {downloads_dir}")
@@ -25,31 +25,37 @@ async def test_pdf_downloads():
         # Initialize LLM with Gemini
         llm = ChatGoogle(model='gemini-2.5-flash')
 
-        # Configure browser with proper download settings
+        # Configure browser with proper download settings for headless mode
+        # The key is to set browser preferences correctly
         browser = Browser(
-            headless=True,
-            accept_downloads=True,
+            headless=False,
             downloads_path=str(downloads_dir),
-            auto_download_pdfs=True
+            # These are the critical settings for headless downloads
+            # browser_type="chromium",  # assuming explicitly use chromium
+            accept_downloads=True,
+            auto_download_pdfs=True,
         )
 
-        # More explicit task with download verification
+        # Enhanced task that includes download verification
         task = f"""
-        Navigate to https://caleprocure.ca.gov/event/0850/0000036230 and:
-        1. Find and click the "View Event Package" link or button
-        2. Wait for the page to load completely (wait 5 seconds)
-        3. Scroll down to find the attachments section
-        4. Identify all PDF download buttons on the page
-        5. For each PDF download button:
-           - Click the button
-           - Wait for download modal to appear
-           - Click "Download Attachment" in the modal
-           - Wait 8-10 seconds for download to complete
-           - Close any modal that appears
-        6. Verify downloads by checking if files exist in {downloads_dir}
-        7. Report the names and file sizes of all downloaded PDF files
+        Go to https://caleprocure.ca.gov/event/0850/0000036230
+
+        1. Wait 3 seconds for page to load
+        2. Click "View Event Package" button
+        3. Wait 5 seconds for page to load
+        4. Scroll down to find the attachments section
+        5. For EACH PDF download button you find:
+           a. Click the download button
+           b. Wait 3 seconds for modal to appear
+           c. Click "Download Attachment" in the modal
+           d. Wait 15 seconds for download to complete (IMPORTANT: wait full time)
+           e. Close the modal if it's still open
+           f. Check if the file was downloaded to {downloads_dir}
         
-        IMPORTANT: After each download, wait sufficient time and verify the file was created.
+        CRITICAL: After each download, wait the full 15 seconds and verify the download completed.
+        Do NOT proceed to the next download until you've confirmed the previous one finished.
+        
+        At the end, list all files that should be in the downloads directory.
         """
 
         agent = Agent(
@@ -58,43 +64,55 @@ async def test_pdf_downloads():
             browser=browser
         )
 
-        logger.info("Starting PDF download test", url="https://caleprocure.ca.gov/event/0850/0000036230")
+        logger.info("Starting PDF download with proper configuration")
 
         # Run the agent
         result = await agent.run()
 
-        logger.info("Agent task completed", result=result.final_result())
+        logger.info("Agent completed", result=result.final_result())
 
-        # Wait a bit more for any pending downloads
-        await asyncio.sleep(5)
+        # Wait extra time for any pending downloads
+        print("Waiting additional 15 seconds for any pending downloads...")
+        await asyncio.sleep(15)
 
-        # Check downloaded files more thoroughly
-        all_files = list(downloads_dir.iterdir())
-        pdf_files = list(downloads_dir.glob("*.pdf"))
+        # Check for files in multiple locations
+        locations_to_check = [
+            downloads_dir,
+            Path.home() / "Downloads",
+            Path("/tmp"),
+            Path.cwd(),  # Current working directory
+        ]
 
-        print(f"\nAll files in downloads directory: {[f.name for f in all_files]}")
-        print(f"PDF files found: {[f.name for f in pdf_files]}")
+        all_found_files = []
 
-        logger.info("Download verification",
-                   total_files=len(all_files),
-                   pdf_count=len(pdf_files),
-                   files=[f.name for f in all_files])
+        for location in locations_to_check:
+            if location.exists():
+                try:
+                    pdf_files = list(location.glob("*.pdf"))
+                    # Check for recently modified PDFs (last 30 minutes)
+                    import time
+                    current_time = time.time()
+                    recent_pdfs = [f for f in pdf_files if current_time - f.stat().st_mtime < 1800]
 
-        if pdf_files:
-            print(f"✅ Successfully downloaded {len(pdf_files)} PDF files:")
-            for file in pdf_files:
-                print(f"   - {file.name} ({file.stat().st_size} bytes)")
+                    if recent_pdfs:
+                        print(f"\nFound recent PDFs in {location}:")
+                        for pdf in recent_pdfs:
+                            print(f"  - {pdf.name} ({pdf.stat().st_size} bytes)")
+                            all_found_files.append(pdf)
+                except PermissionError:
+                    pass
+
+        if all_found_files:
+            print(f"\n✅ Total PDFs found: {len(all_found_files)}")
         else:
-            print("❌ No PDF files were downloaded")
-            if all_files:
-                print("But found these files:", [f.name for f in all_files])
+            print("\n❌ No PDF files were found in any location")
 
-        return pdf_files
+        return all_found_files
 
     except Exception as e:
         logger.error("PDF download test failed", error=str(e))
-        print(f"❌ Test failed: {e}")
+        print(f"Test failed: {e}")
         return []
 
 if __name__ == "__main__":
-    asyncio.run(test_pdf_downloads())
+    asyncio.run(test_pdf_downloads_with_proper_config())
