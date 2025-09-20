@@ -36,7 +36,7 @@ USER app
 # Install playwright browsers as non-root user
 RUN playwright install chromium
 
-ENV PYTHONPATH=/app BROWSER_HEADLESS=true
+ENV PYTHONPATH=/app
 
 EXPOSE 8000
 

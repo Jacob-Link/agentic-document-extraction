@@ -1,7 +1,6 @@
 import os
 import asyncio
 import time
-from typing import Optional
 from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError

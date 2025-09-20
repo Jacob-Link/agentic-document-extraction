@@ -1,5 +1,4 @@
 import asyncio
-import httpx
 from pathlib import Path
 from dotenv import load_dotenv
 from browser_use import Agent, ChatGoogle, Browser

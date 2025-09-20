@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List
 import structlog
 from browser_use import Agent, ChatGoogle
-from ..s3.s3_dummy import S3DummyClient
+from src.s3.s3_dummy import S3DummyClient
 
 logger = structlog.get_logger(__name__)
 

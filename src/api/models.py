@@ -9,11 +9,6 @@ class ExtractRequest(BaseModel):
 
 class ExtractResponse(BaseModel):
     """Response model for PDF extraction endpoint."""
-    status : str           = Field(...       , description="Status of the extraction operation")
-    files  : List[str]     = Field(default=[], description="List of S3 URIs for uploaded files")
-    message: Optional[str] = Field(None      , description="Additional message or error details")
-
-class ErrorResponse(BaseModel):
-    """Error response model."""
-    error  : str           = Field(..., description="Error message")
-    details: Optional[str] = Field(None, description="Additional error details")
+    status : str                 = Field(...       , description="Status of the extraction operation (success or fail)")
+    files  : Optional[List[str]] = Field(default=[], description="List of S3 URIs for uploaded files")
+    message: Optional[str]       = Field(None      , description="Additional message or error details")

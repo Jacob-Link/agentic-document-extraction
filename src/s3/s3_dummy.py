@@ -2,7 +2,7 @@
 
 import os
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List
 import structlog
 import boto3
 from botocore.exceptions import ClientError

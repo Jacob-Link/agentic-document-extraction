@@ -1,12 +1,12 @@
 import os
-import asyncio
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import traceback
+from fastapi import FastAPI
 from dotenv import load_dotenv
 import structlog
+import uvicorn
 
-from .models import ExtractRequest, ExtractResponse, ErrorResponse
-from ..agent.document_extractor import DocumentExtractor
+from src.api.models import ExtractRequest, ExtractResponse
+from src.agent.document_extractor import DocumentExtractor
 
 load_dotenv()
 
@@ -18,14 +18,6 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -42,7 +34,7 @@ async def health():
         "aws_configured": bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
     }
 
-@app.post("/extract", response_model=ExtractResponse, responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+@app.post("/extract", response_model=ExtractResponse)
 async def extract_documents(request: ExtractRequest):
     """
     Extract PDF documents from a procurement website and upload to S3.
@@ -66,21 +58,18 @@ async def extract_documents(request: ExtractRequest):
 
         logger.info("Document extraction completed", file_count=len(extracted_files))
 
-        return ExtractResponse(
-            status="success",
-            files=extracted_files,
-            message=f"Successfully extracted {len(extracted_files)} documents"
-        )
-
-    except ValueError as e:
-        logger.error("Validation error during extraction", error=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+        return ExtractResponse(status = "success",
+                               files  = extracted_files,
+                               message= f">>> successfully extracted {len(extracted_files)} documents",
+                               )
 
     except Exception as e:
-        logger.error("Unexpected error during extraction", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        error_traceback = traceback.format_exc()
+        logger.error(">>> Unexpected error during extraction", error=str(e), traceback=error_traceback)
+        return ExtractResponse(status = "failed",
+                               files  = None,
+                               message= f"Error: {str(e)}\n\nFull traceback:\n{error_traceback}",
+                               )
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
